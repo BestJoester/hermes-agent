@@ -931,6 +931,7 @@ class AIAgent:
         stream_delta_callback: callable = None,
         interim_assistant_callback: callable = None,
         tool_gen_callback: callable = None,
+        tool_output_callback: callable = None,
         status_callback: callable = None,
         max_tokens: int = None,
         reasoning_config: Dict[str, Any] = None,
@@ -1152,6 +1153,7 @@ class AIAgent:
         self.interim_assistant_callback = interim_assistant_callback
         self.status_callback = status_callback
         self.tool_gen_callback = tool_gen_callback
+        self.tool_output_callback = tool_output_callback
 
         
         # Tool execution state — allows _vprint during tool execution
@@ -9470,7 +9472,7 @@ class AIAgent:
             if self.tool_progress_callback:
                 try:
                     preview = _build_tool_preview(name, args)
-                    self.tool_progress_callback("tool.started", name, preview, args)
+                    self.tool_progress_callback("tool.started", name, preview, args, tool_id=getattr(tc, "id", "") or "")
                 except Exception as cb_err:
                     logging.debug(f"Tool progress callback error: {cb_err}")
 
@@ -9527,6 +9529,25 @@ class AIAgent:
             try:
                 from tools.environments.base import set_activity_callback
                 set_activity_callback(self._touch_activity)
+            except Exception:
+                pass
+            # Register a per-tool-call streaming output callback so the drain
+            # loop can forward subprocess stdout chunks to the gateway / WebUI
+            # in real time. The wrapper closes over the tool's name + id so
+            # the SSE event downstream can route the chunk to the right card.
+            try:
+                from tools.environments.base import set_tool_output_callback
+                if self.tool_output_callback:
+                    _name_for_cb = function_name
+                    _tid_for_cb = getattr(tool_call, "id", "") or ""
+                    def _output_wrapper(_chunk, _n=_name_for_cb, _t=_tid_for_cb):
+                        try:
+                            self.tool_output_callback(_n, _t, _chunk)
+                        except Exception:
+                            pass
+                    set_tool_output_callback(_output_wrapper)
+                else:
+                    set_tool_output_callback(None)
             except Exception:
                 pass
             # Propagate approval/sudo callbacks to this worker thread.
@@ -9685,6 +9706,7 @@ class AIAgent:
                         self.tool_progress_callback(
                             "tool.completed", function_name, None, None,
                             duration=tool_duration, is_error=is_error,
+                            tool_id=getattr(tool_call, "id", "") or "",
                         )
                     except Exception as cb_err:
                         logging.debug(f"Tool progress callback error: {cb_err}")
@@ -9827,15 +9849,26 @@ class AIAgent:
             # the agent while a command is running.
             if not _execution_blocked:
                 try:
-                    from tools.environments.base import set_activity_callback
+                    from tools.environments.base import set_activity_callback, set_tool_output_callback
                     set_activity_callback(self._touch_activity)
+                    if self.tool_output_callback:
+                        _name_for_cb = function_name
+                        _tid_for_cb = getattr(tool_call, "id", "") or ""
+                        def _output_wrapper(_chunk, _n=_name_for_cb, _t=_tid_for_cb):
+                            try:
+                                self.tool_output_callback(_n, _t, _chunk)
+                            except Exception:
+                                pass
+                        set_tool_output_callback(_output_wrapper)
+                    else:
+                        set_tool_output_callback(None)
                 except Exception:
                     pass
 
             if not _execution_blocked and self.tool_progress_callback:
                 try:
                     preview = _build_tool_preview(function_name, function_args)
-                    self.tool_progress_callback("tool.started", function_name, preview, function_args)
+                    self.tool_progress_callback("tool.started", function_name, preview, function_args, tool_id=getattr(tool_call, "id", "") or "")
                 except Exception as cb_err:
                     logging.debug(f"Tool progress callback error: {cb_err}")
 
@@ -10083,6 +10116,7 @@ class AIAgent:
                     self.tool_progress_callback(
                         "tool.completed", function_name, None, None,
                         duration=tool_duration, is_error=_is_error_result,
+                        tool_id=getattr(tool_call, "id", "") or "",
                     )
                 except Exception as cb_err:
                     logging.debug(f"Tool progress callback error: {cb_err}")
