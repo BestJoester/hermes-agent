@@ -1167,6 +1167,16 @@ class AIAgent:
         self._interrupt_thread_signal_pending = False
         self._client_lock = threading.RLock()
 
+        # Active per-request httpx clients currently mid-stream from the LLM.
+        # On interrupt() we force-close every entry to abort the in-flight
+        # `chat.completions.create` read, which is otherwise blocked waiting
+        # for the next chunk from the upstream server (llama.cpp / vLLM /
+        # OpenAI). Without this, _interrupt_requested only takes effect after
+        # the next chunk arrives, so the model keeps generating tokens until
+        # the upstream server itself decides to stop.
+        self._active_request_clients: list = []
+        self._active_request_clients_lock = threading.Lock()
+
         # /steer mechanism — inject a user note into the next tool result
         # without interrupting the agent. Unlike interrupt(), steer() does
         # NOT set _interrupt_requested; it waits for the current tool batch
@@ -4363,6 +4373,25 @@ class AIAgent:
         """
         self._interrupt_requested = True
         self._interrupt_message = message
+        # Force-close every in-flight per-request httpx client BEFORE
+        # signaling tool/worker threads. The streaming `for chunk in stream`
+        # loop is otherwise blocked inside httpx waiting for the next chunk
+        # from the upstream LLM (llama.cpp, vLLM, OpenAI, etc.) and only
+        # checks _interrupt_requested between chunks — so without tearing
+        # down the socket, the model keeps generating until *its* server
+        # decides to stop. Closing the httpx client closes the underlying
+        # connection pool, which causes the next read on the SSE socket to
+        # raise immediately, breaking the chunk loop.
+        with self._active_request_clients_lock:
+            _clients_to_close = list(self._active_request_clients)
+            self._active_request_clients.clear()
+        for _client in _clients_to_close:
+            try:
+                self._close_openai_client(
+                    _client, reason="interrupt_force_close", shared=False
+                )
+            except Exception as _e:
+                logger.debug("interrupt force-close failed: %s", _e)
         # Signal all tools to abort any in-flight operations immediately.
         # Scope the interrupt to this agent's execution thread so other
         # agents running in the same process (gateway) are not affected.
@@ -5821,9 +5850,19 @@ class AIAgent:
             and self._api_kwargs_have_image_parts(api_kwargs or {})
         ):
             request_kwargs["default_headers"] = self._copilot_headers_for_request(is_vision=True)
-        return self._create_openai_client(request_kwargs, reason=reason, shared=False)
+        client = self._create_openai_client(request_kwargs, reason=reason, shared=False)
+        # Track for force-close on interrupt(). Mock clients still get
+        # tracked — _close_openai_client is a no-op for those.
+        with self._active_request_clients_lock:
+            self._active_request_clients.append(client)
+        return client
 
     def _close_request_openai_client(self, client: Any, *, reason: str) -> None:
+        with self._active_request_clients_lock:
+            try:
+                self._active_request_clients.remove(client)
+            except ValueError:
+                pass  # Already removed by interrupt() force-close
         self._close_openai_client(client, reason=reason, shared=False)
 
     def _run_codex_stream(self, api_kwargs: dict, client: Any = None, on_first_delta: callable = None):
