@@ -130,11 +130,14 @@ def _count_diff_changes(diff_text: str) -> tuple[int, int]:
 def _truncate_diff(diff_text: str) -> tuple[str, bool]:
     """Cap a unified diff at ``_DIFF_MAX_BYTES`` / ``_DIFF_MAX_LINES``.
 
-    Returns ``(truncated_text, was_truncated)``. The truncation marker is a
-    plain text line the frontend renders as a muted footer. We cut on
-    line boundaries (no half-lines) and prefer cutting at hunk boundaries
-    when possible so the result still parses as valid unified-diff
-    content for any consumer that's not the WebUI.
+    Returns ``(truncated_text, was_truncated)``. We cut on line boundaries
+    (no half-lines) and prefer cutting at hunk boundaries when possible so
+    the result still parses as valid unified-diff content for any consumer
+    that's not the WebUI. No inline marker is appended to the diff body —
+    a hyphen-prefixed marker would be misparsed as a deletion line, and a
+    `---`/`+++` prefix would collide with file headers; instead the caller
+    signals truncation via ``WriteResult.diff_truncated`` /
+    ``PatchResult.diff_truncated``, and UIs render their own footer.
     """
     if not diff_text:
         return ("", False)
@@ -166,10 +169,7 @@ def _truncate_diff(diff_text: str) -> tuple[str, bool]:
         prior_hunks = sum(1 for ln in kept[:last_hunk_start] if ln.startswith("@@"))
         if prior_hunks >= 1:
             kept = kept[:last_hunk_start]
-    omitted = len(lines) - len(kept)
-    truncated = "\n".join(kept).rstrip("\n")
-    truncated += f"\n-- diff truncated, {omitted} more line{'' if omitted == 1 else 's'} --\n"
-    return (truncated, True)
+    return ("\n".join(kept).rstrip("\n") + "\n", True)
 
 
 @dataclass
