@@ -931,6 +931,7 @@ class AIAgent:
         stream_delta_callback: callable = None,
         interim_assistant_callback: callable = None,
         tool_gen_callback: callable = None,
+        tool_delta_callback: callable = None,
         status_callback: callable = None,
         max_tokens: int = None,
         reasoning_config: Dict[str, Any] = None,
@@ -1152,6 +1153,7 @@ class AIAgent:
         self.interim_assistant_callback = interim_assistant_callback
         self.status_callback = status_callback
         self.tool_gen_callback = tool_gen_callback
+        self.tool_delta_callback = tool_delta_callback
 
         
         # Tool execution state — allows _vprint during tool execution
@@ -6916,6 +6918,16 @@ class AIAgent:
                                 entry["function"]["name"] = tc_delta.function.name
                             if tc_delta.function.arguments:
                                 entry["function"]["arguments"] += tc_delta.function.arguments
+                                # Fire incremental tool delta callback
+                                if self.tool_delta_callback:
+                                    try:
+                                        self.tool_delta_callback(
+                                            entry["function"]["name"],
+                                            entry["function"]["arguments"],
+                                            entry.get("id", ""),
+                                        )
+                                    except Exception:
+                                        pass
                         extra = getattr(tc_delta, "extra_content", None)
                         if extra is None and hasattr(tc_delta, "model_extra"):
                             extra = (tc_delta.model_extra or {}).get("extra_content")
