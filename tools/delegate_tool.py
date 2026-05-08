@@ -1026,7 +1026,52 @@ def _build_child_agent(
     except Exception as exc:
         logger.debug("Could not load delegation reasoning_effort: %s", exc)
 
-    child = AIAgent(
+    # ── WebUI sub-agent event forwarding ──────────────────────────────
+    # When the agent runs under hermes-webui, the parent has a factory
+    # method (_make_subagent_callbacks) that builds AIAgent callbacks
+    # forwarding child events to the parent's SSE stream tagged with
+    # subagent_id. The frontend uses those events to render a per-
+    # delegation conversation tab. CLI-driven runs leave this attribute
+    # unset, so subagent_kwargs stays empty and the existing TUI/
+    # progress-callback path is unchanged.
+    subagent_kwargs: Dict[str, Any] = {}
+    _subagent_factory = getattr(parent_agent, "_make_subagent_callbacks", None)
+    if callable(_subagent_factory):
+        try:
+            subagent_kwargs = _subagent_factory(
+                subagent_id,
+                parent_id=parent_subagent_id,
+                goal=goal,
+                depth=tui_depth,
+                model=effective_model_for_cb,
+            ) or {}
+        except Exception as exc:
+            logger.debug("subagent callback factory failed for %s: %s", subagent_id, exc)
+            subagent_kwargs = {}
+
+    def _chain(*callbacks):
+        """Combine multiple callables into one; skip None entries.
+        Returns the single callback if only one is non-None, the chained
+        wrapper if multiple, or None if all are None."""
+        non_null = [cb for cb in callbacks if cb is not None]
+        if not non_null:
+            return None
+        if len(non_null) == 1:
+            return non_null[0]
+        def _chained(*args, **kwargs):
+            for _cb in non_null:
+                try:
+                    _cb(*args, **kwargs)
+                except Exception as _exc:
+                    logger.debug("chained callback raised: %s", _exc)
+        return _chained
+
+    # Merge the existing TUI/progress callbacks with the subagent-tagged
+    # WebUI ones. tool_progress_callback already feeds the spawn-tree
+    # display; we chain so both paths fire. Other callbacks (reasoning,
+    # tool_delta, tool_output, tool_complete, stream_delta) are only
+    # consumed by the WebUI path so we just take the subagent version.
+    _agent_kwargs = dict(
         base_url=effective_base_url,
         api_key=effective_api_key,
         model=effective_model,
@@ -1053,9 +1098,30 @@ def _build_child_agent(
         providers_ignored=parent_agent.providers_ignored,
         providers_order=parent_agent.providers_order,
         provider_sort=parent_agent.provider_sort,
-        tool_progress_callback=child_progress_cb,
+        tool_progress_callback=_chain(
+            child_progress_cb, subagent_kwargs.get("tool_progress_callback")
+        ),
         iteration_budget=None,  # fresh budget per subagent
     )
+    # Spread the WebUI subagent callbacks into AIAgent kwargs ONLY when the
+    # __init__ signature actually accepts them (older hermes-agent builds
+    # may lack tool_output_callback, etc.). Filter against the inspected
+    # AIAgent params so a missing kwarg doesn't crash construction.
+    try:
+        import inspect as _inspect
+        _agent_params = set(_inspect.signature(AIAgent.__init__).parameters)
+    except Exception:
+        _agent_params = set()
+    for _k in (
+        "reasoning_callback",
+        "stream_delta_callback",
+        "tool_delta_callback",
+        "tool_output_callback",
+        "tool_complete_callback",
+    ):
+        if _k in _agent_params and _k in subagent_kwargs:
+            _agent_kwargs[_k] = subagent_kwargs[_k]
+    child = AIAgent(**_agent_kwargs)
     child._print_fn = getattr(parent_agent, "_print_fn", None)
     # Set delegation depth so children can't spawn grandchildren
     child._delegate_depth = child_depth
@@ -1067,6 +1133,19 @@ def _build_child_agent(
     child._subagent_id = subagent_id
     child._parent_subagent_id = parent_subagent_id
     child._subagent_goal = goal
+
+    # Propagate the WebUI sub-agent infrastructure to the child so nested
+    # delegations (orchestrator -> worker -> grandchild) also forward their
+    # events to the same parent SSE stream. The child will use these the
+    # same way the parent does when its own _build_child_agent runs.
+    if callable(_subagent_factory):
+        child._make_subagent_callbacks = _subagent_factory
+    _parent_subagent_completed = getattr(parent_agent, "_subagent_completed", None)
+    if callable(_parent_subagent_completed):
+        child._subagent_completed = _parent_subagent_completed
+    _parent_subagent_put = getattr(parent_agent, "_subagent_put_event", None)
+    if callable(_parent_subagent_put):
+        child._subagent_put_event = _parent_subagent_put
 
     # Share a credential pool with the child when possible so subagents can
     # rotate credentials on rate limits instead of getting pinned to one key.
@@ -1770,6 +1849,33 @@ def _run_single_child(
         # child was never registered (e.g. ID missing on test doubles).
         if _subagent_id:
             _unregister_subagent(_subagent_id)
+
+        # WebUI sub-agent tab lifecycle: tell the parent's SSE stream the
+        # tab is done so the frontend can mark it complete and stop
+        # listening for new events. Inherited from the parent if running
+        # under hermes-webui; CLI runs leave _subagent_completed unset.
+        _completed_cb = getattr(parent_agent, "_subagent_completed", None)
+        if _subagent_id and callable(_completed_cb):
+            try:
+                # Best-effort: pull final status from whatever local var is set.
+                # `entry` exists in the success path; `exc` exists in the failure
+                # path. We tolerate both being undefined here (NameError caught).
+                try:
+                    _final_status = entry.get("status") if isinstance(entry, dict) else "completed"  # noqa: F821
+                    _final_summary = entry.get("summary") if isinstance(entry, dict) else None  # noqa: F821
+                    _final_error = entry.get("error") if isinstance(entry, dict) else None  # noqa: F821
+                except NameError:
+                    _final_status = "error"
+                    _final_summary = None
+                    _final_error = str(exc) if "exc" in dir() else "subagent did not complete"  # noqa: F821
+                _completed_cb(
+                    _subagent_id,
+                    status=_final_status or "completed",
+                    result=_final_summary,
+                    error=_final_error,
+                )
+            except Exception as _emit_exc:
+                logger.debug("subagent_completed emit failed: %s", _emit_exc)
 
         if child_pool is not None and leased_cred_id is not None:
             try:
