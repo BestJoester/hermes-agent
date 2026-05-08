@@ -931,6 +931,8 @@ class AIAgent:
         stream_delta_callback: callable = None,
         interim_assistant_callback: callable = None,
         tool_gen_callback: callable = None,
+        tool_delta_callback: callable = None,
+        tool_output_callback: callable = None,
         status_callback: callable = None,
         max_tokens: int = None,
         reasoning_config: Dict[str, Any] = None,
@@ -1152,6 +1154,8 @@ class AIAgent:
         self.interim_assistant_callback = interim_assistant_callback
         self.status_callback = status_callback
         self.tool_gen_callback = tool_gen_callback
+        self.tool_delta_callback = tool_delta_callback
+        self.tool_output_callback = tool_output_callback
 
         
         # Tool execution state — allows _vprint during tool execution
@@ -1166,6 +1170,16 @@ class AIAgent:
         self._execution_thread_id: int | None = None  # Set at run_conversation() start
         self._interrupt_thread_signal_pending = False
         self._client_lock = threading.RLock()
+
+        # Active per-request httpx clients currently mid-stream from the LLM.
+        # On interrupt() we force-close every entry to abort the in-flight
+        # `chat.completions.create` read, which is otherwise blocked waiting
+        # for the next chunk from the upstream server (llama.cpp / vLLM /
+        # OpenAI). Without this, _interrupt_requested only takes effect after
+        # the next chunk arrives, so the model keeps generating tokens until
+        # the upstream server itself decides to stop.
+        self._active_request_clients: list = []
+        self._active_request_clients_lock = threading.Lock()
 
         # /steer mechanism — inject a user note into the next tool result
         # without interrupting the agent. Unlike interrupt(), steer() does
@@ -1257,6 +1271,10 @@ class AIAgent:
         # Rate limit tracking — updated from x-ratelimit-* response headers
         # after each API call.  Accessed by /usage slash command.
         self._rate_limit_state: Optional["RateLimitState"] = None
+
+        # OpenRouter response cache hit counter — incremented when
+        # X-OpenRouter-Cache-Status: HIT is seen in streaming response headers.
+        self._or_cache_hits: int = 0
 
         # Centralized logging — agent.log (INFO+) and errors.log (WARNING+)
         # both live under ~/.hermes/logs/.  Idempotent, so gateway mode
@@ -1421,11 +1439,8 @@ class AIAgent:
                     client_kwargs["args"] = self.acp_args
                 effective_base = base_url
                 if base_url_host_matches(effective_base, "openrouter.ai"):
-                    client_kwargs["default_headers"] = {
-                        "HTTP-Referer": "https://hermes-agent.nousresearch.com",
-                        "X-OpenRouter-Title": "Hermes Agent",
-                        "X-OpenRouter-Categories": "productivity,cli-agent",
-                    }
+                    from agent.auxiliary_client import build_or_headers
+                    client_kwargs["default_headers"] = build_or_headers()
                 elif base_url_host_matches(effective_base, "api.routermint.com"):
                     client_kwargs["default_headers"] = _routermint_headers()
                 elif base_url_host_matches(effective_base, "api.githubcopilot.com"):
@@ -4362,6 +4377,25 @@ class AIAgent:
         """
         self._interrupt_requested = True
         self._interrupt_message = message
+        # Force-close every in-flight per-request httpx client BEFORE
+        # signaling tool/worker threads. The streaming `for chunk in stream`
+        # loop is otherwise blocked inside httpx waiting for the next chunk
+        # from the upstream LLM (llama.cpp, vLLM, OpenAI, etc.) and only
+        # checks _interrupt_requested between chunks — so without tearing
+        # down the socket, the model keeps generating until *its* server
+        # decides to stop. Closing the httpx client closes the underlying
+        # connection pool, which causes the next read on the SSE socket to
+        # raise immediately, breaking the chunk loop.
+        with self._active_request_clients_lock:
+            _clients_to_close = list(self._active_request_clients)
+            self._active_request_clients.clear()
+        for _client in _clients_to_close:
+            try:
+                self._close_openai_client(
+                    _client, reason="interrupt_force_close", shared=False
+                )
+            except Exception as _e:
+                logger.debug("interrupt force-close failed: %s", _e)
         # Signal all tools to abort any in-flight operations immediately.
         # Scope the interrupt to this agent's execution thread so other
         # agents running in the same process (gateway) are not affected.
@@ -4579,6 +4613,28 @@ class AIAgent:
     def get_rate_limit_state(self):
         """Return the last captured RateLimitState, or None."""
         return self._rate_limit_state
+
+    def _check_openrouter_cache_status(self, http_response: Any) -> None:
+        """Read X-OpenRouter-Cache-Status from response headers and log it.
+
+        Increments ``_or_cache_hits`` on HIT so callers can report savings.
+        """
+        if http_response is None:
+            return
+        headers = getattr(http_response, "headers", None)
+        if not headers:
+            return
+        try:
+            status = headers.get("x-openrouter-cache-status")
+            if not status:
+                return
+            if status.upper() == "HIT":
+                self._or_cache_hits += 1
+                logger.info("OpenRouter response cache HIT (total: %d)", self._or_cache_hits)
+            else:
+                logger.debug("OpenRouter response cache %s", status.upper())
+        except Exception:
+            pass  # Never let header parsing break the agent loop
 
     def get_activity_summary(self) -> dict:
         """Return a snapshot of the agent's current activity for diagnostics.
@@ -5798,9 +5854,19 @@ class AIAgent:
             and self._api_kwargs_have_image_parts(api_kwargs or {})
         ):
             request_kwargs["default_headers"] = self._copilot_headers_for_request(is_vision=True)
-        return self._create_openai_client(request_kwargs, reason=reason, shared=False)
+        client = self._create_openai_client(request_kwargs, reason=reason, shared=False)
+        # Track for force-close on interrupt(). Mock clients still get
+        # tracked — _close_openai_client is a no-op for those.
+        with self._active_request_clients_lock:
+            self._active_request_clients.append(client)
+        return client
 
     def _close_request_openai_client(self, client: Any, *, reason: str) -> None:
+        with self._active_request_clients_lock:
+            try:
+                self._active_request_clients.remove(client)
+            except ValueError:
+                pass  # Already removed by interrupt() force-close
         self._close_openai_client(client, reason=reason, shared=False)
 
     def _run_codex_stream(self, api_kwargs: dict, client: Any = None, on_first_delta: callable = None):
@@ -6157,10 +6223,10 @@ class AIAgent:
         return True
 
     def _apply_client_headers_for_base_url(self, base_url: str) -> None:
-        from agent.auxiliary_client import _AI_GATEWAY_HEADERS, _OR_HEADERS
+        from agent.auxiliary_client import _AI_GATEWAY_HEADERS, build_or_headers
 
         if base_url_host_matches(base_url, "openrouter.ai"):
-            self._client_kwargs["default_headers"] = dict(_OR_HEADERS)
+            self._client_kwargs["default_headers"] = build_or_headers()
         elif base_url_host_matches(base_url, "ai-gateway.vercel.sh"):
             self._client_kwargs["default_headers"] = dict(_AI_GATEWAY_HEADERS)
         elif base_url_host_matches(base_url, "api.routermint.com"):
@@ -6780,6 +6846,9 @@ class AIAgent:
             # response via .response before any chunks are consumed.
             self._capture_rate_limits(getattr(stream, "response", None))
 
+            # Log OpenRouter response cache status when present.
+            self._check_openrouter_cache_status(getattr(stream, "response", None))
+
             content_parts: list = []
             tool_calls_acc: dict = {}
             tool_gen_notified: set = set()
@@ -6890,6 +6959,16 @@ class AIAgent:
                                 entry["function"]["name"] = tc_delta.function.name
                             if tc_delta.function.arguments:
                                 entry["function"]["arguments"] += tc_delta.function.arguments
+                                # Fire incremental tool delta callback
+                                if self.tool_delta_callback:
+                                    try:
+                                        self.tool_delta_callback(
+                                            entry["function"]["name"],
+                                            entry["function"]["arguments"],
+                                            entry.get("id", ""),
+                                        )
+                                    except Exception:
+                                        pass
                         extra = getattr(tc_delta, "extra_content", None)
                         if extra is None and hasattr(tc_delta, "model_extra"):
                             extra = (tc_delta.model_extra or {}).get("extra_content")
@@ -9470,7 +9549,7 @@ class AIAgent:
             if self.tool_progress_callback:
                 try:
                     preview = _build_tool_preview(name, args)
-                    self.tool_progress_callback("tool.started", name, preview, args)
+                    self.tool_progress_callback("tool.started", name, preview, args, tool_id=getattr(tc, "id", "") or "")
                 except Exception as cb_err:
                     logging.debug(f"Tool progress callback error: {cb_err}")
 
@@ -9527,6 +9606,25 @@ class AIAgent:
             try:
                 from tools.environments.base import set_activity_callback
                 set_activity_callback(self._touch_activity)
+            except Exception:
+                pass
+            # Register a per-tool-call streaming output callback so the drain
+            # loop can forward subprocess stdout chunks to the gateway / WebUI
+            # in real time. The wrapper closes over the tool's name + id so
+            # the SSE event downstream can route the chunk to the right card.
+            try:
+                from tools.environments.base import set_tool_output_callback
+                if self.tool_output_callback:
+                    _name_for_cb = function_name
+                    _tid_for_cb = getattr(tool_call, "id", "") or ""
+                    def _output_wrapper(_chunk, _n=_name_for_cb, _t=_tid_for_cb):
+                        try:
+                            self.tool_output_callback(_n, _t, _chunk)
+                        except Exception:
+                            pass
+                    set_tool_output_callback(_output_wrapper)
+                else:
+                    set_tool_output_callback(None)
             except Exception:
                 pass
             # Propagate approval/sudo callbacks to this worker thread.
@@ -9685,6 +9783,7 @@ class AIAgent:
                         self.tool_progress_callback(
                             "tool.completed", function_name, None, None,
                             duration=tool_duration, is_error=is_error,
+                            tool_id=getattr(tool_call, "id", "") or "",
                         )
                     except Exception as cb_err:
                         logging.debug(f"Tool progress callback error: {cb_err}")
@@ -9827,15 +9926,26 @@ class AIAgent:
             # the agent while a command is running.
             if not _execution_blocked:
                 try:
-                    from tools.environments.base import set_activity_callback
+                    from tools.environments.base import set_activity_callback, set_tool_output_callback
                     set_activity_callback(self._touch_activity)
+                    if self.tool_output_callback:
+                        _name_for_cb = function_name
+                        _tid_for_cb = getattr(tool_call, "id", "") or ""
+                        def _output_wrapper(_chunk, _n=_name_for_cb, _t=_tid_for_cb):
+                            try:
+                                self.tool_output_callback(_n, _t, _chunk)
+                            except Exception:
+                                pass
+                        set_tool_output_callback(_output_wrapper)
+                    else:
+                        set_tool_output_callback(None)
                 except Exception:
                     pass
 
             if not _execution_blocked and self.tool_progress_callback:
                 try:
                     preview = _build_tool_preview(function_name, function_args)
-                    self.tool_progress_callback("tool.started", function_name, preview, function_args)
+                    self.tool_progress_callback("tool.started", function_name, preview, function_args, tool_id=getattr(tool_call, "id", "") or "")
                 except Exception as cb_err:
                     logging.debug(f"Tool progress callback error: {cb_err}")
 
@@ -10083,6 +10193,7 @@ class AIAgent:
                     self.tool_progress_callback(
                         "tool.completed", function_name, None, None,
                         duration=tool_duration, is_error=_is_error_result,
+                        tool_id=getattr(tool_call, "id", "") or "",
                     )
                 except Exception as cb_err:
                     logging.debug(f"Tool progress callback error: {cb_err}")

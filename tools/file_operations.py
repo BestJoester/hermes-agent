@@ -93,6 +93,85 @@ class ReadResult:
         return {k: v for k, v in self.__dict__.items() if v is not None and v != []}
 
 
+# Diff truncation thresholds. Chosen so that a "rewrite this entire 5000-line
+# file" diff still fits, while a pathological "regenerate this 100k-line build
+# artifact" diff doesn't bloat the SSE event or the browser DOM. Whichever
+# limit hits first wins. Stats (additions/deletions) are computed off the
+# pre-truncation diff so the count shown to the user remains accurate.
+_DIFF_MAX_BYTES = 500_000  # 500 KB
+_DIFF_MAX_LINES = 5_000
+
+
+def _count_diff_changes(diff_text: str) -> tuple[int, int]:
+    """Return (additions, deletions) line counts for a unified diff.
+
+    Skips the file-header lines (``+++ b/...``, ``--- a/...``) so they don't
+    inflate the count by 1 each. Hunk headers (``@@ ... @@``) start with
+    neither + nor - so they're naturally excluded.
+    """
+    if not diff_text:
+        return (0, 0)
+    additions = 0
+    deletions = 0
+    for line in diff_text.split("\n"):
+        if not line:
+            continue
+        if line.startswith("+++"):
+            continue
+        if line.startswith("---"):
+            continue
+        if line[0] == "+":
+            additions += 1
+        elif line[0] == "-":
+            deletions += 1
+    return (additions, deletions)
+
+
+def _truncate_diff(diff_text: str) -> tuple[str, bool]:
+    """Cap a unified diff at ``_DIFF_MAX_BYTES`` / ``_DIFF_MAX_LINES``.
+
+    Returns ``(truncated_text, was_truncated)``. We cut on line boundaries
+    (no half-lines) and prefer cutting at hunk boundaries when possible so
+    the result still parses as valid unified-diff content for any consumer
+    that's not the WebUI. No inline marker is appended to the diff body —
+    a hyphen-prefixed marker would be misparsed as a deletion line, and a
+    `---`/`+++` prefix would collide with file headers; instead the caller
+    signals truncation via ``WriteResult.diff_truncated`` /
+    ``PatchResult.diff_truncated``, and UIs render their own footer.
+    """
+    if not diff_text:
+        return ("", False)
+    if len(diff_text) <= _DIFF_MAX_BYTES and diff_text.count("\n") <= _DIFF_MAX_LINES:
+        return (diff_text, False)
+    lines = diff_text.split("\n")
+    # Walk forward keeping cumulative byte count, stop when either limit
+    # is exceeded. Then back up to the last hunk-start (``@@``) so the
+    # truncated diff still ends on a clean boundary if one exists.
+    kept = []
+    bytes_accum = 0
+    last_hunk_start = -1
+    for i, line in enumerate(lines):
+        line_bytes = len(line) + 1  # +1 for the newline
+        if bytes_accum + line_bytes > _DIFF_MAX_BYTES:
+            break
+        if i + 1 > _DIFF_MAX_LINES:
+            break
+        kept.append(line)
+        bytes_accum += line_bytes
+        if line.startswith("@@"):
+            last_hunk_start = len(kept) - 1
+    # Prefer truncating right before the last hunk we started but couldn't
+    # finish, instead of mid-hunk. Only do this if the partial hunk
+    # actually started — i.e. there's at least one full hunk before it.
+    if last_hunk_start >= 0 and last_hunk_start < len(kept) - 1:
+        # Count full hunks that landed before the partial one. If at
+        # least one full hunk fits, drop the partial.
+        prior_hunks = sum(1 for ln in kept[:last_hunk_start] if ln.startswith("@@"))
+        if prior_hunks >= 1:
+            kept = kept[:last_hunk_start]
+    return ("\n".join(kept).rstrip("\n") + "\n", True)
+
+
 @dataclass
 class WriteResult:
     """Result from writing a file."""
@@ -100,9 +179,42 @@ class WriteResult:
     dirs_created: bool = False
     error: Optional[str] = None
     warning: Optional[str] = None
-    
+    # Unified diff between the prior file content (or empty string for a new
+    # file) and the just-written content. Empty string means no diff was
+    # computed — either the file is binary, the read of the prior content
+    # failed for a non-not-found reason, or no path through write_file_tool
+    # set it. Frontend uses this to render an opencode-style line-by-line
+    # diff in the tool card; falls back to a plain textual summary if absent.
+    diff: str = ""
+    additions: int = 0
+    deletions: int = 0
+    # True when the diff body was clipped to keep the wire payload bounded;
+    # `additions` and `deletions` always reflect the FULL diff regardless of
+    # truncation so the stats line shown to the user remains accurate.
+    diff_truncated: bool = False
+
     def to_dict(self) -> dict:
-        return {k: v for k, v in self.__dict__.items() if v is not None}
+        # Match PatchResult's "skip falsy defaults" pattern so the wire
+        # payload stays compact for the common case of a small successful
+        # write — but always include `bytes_written` even when 0, since a
+        # zero-byte write is a legitimate result the caller may want to
+        # see (and 0 is the only field where falsy is meaningful).
+        result = {"bytes_written": self.bytes_written}
+        if self.dirs_created:
+            result["dirs_created"] = self.dirs_created
+        if self.error:
+            result["error"] = self.error
+        if self.warning:
+            result["warning"] = self.warning
+        if self.diff:
+            result["diff"] = self.diff
+        if self.additions:
+            result["additions"] = self.additions
+        if self.deletions:
+            result["deletions"] = self.deletions
+        if self.diff_truncated:
+            result["diff_truncated"] = self.diff_truncated
+        return result
 
 
 @dataclass
@@ -115,11 +227,33 @@ class PatchResult:
     files_deleted: List[str] = field(default_factory=list)
     lint: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
-    
+    # Pre-counted change stats matching WriteResult. Computed from the diff
+    # in to_dict() rather than carried through the patch_replace pipeline,
+    # so existing callers that build PatchResult directly don't need to
+    # populate these. UIs prefer these over deriving them client-side.
+    additions: int = 0
+    deletions: int = 0
+    diff_truncated: bool = False
+
     def to_dict(self) -> dict:
         result = {"success": self.success}
         if self.diff:
-            result["diff"] = self.diff
+            # Re-derive stats from the diff if the caller hasn't provided
+            # them (the common case — patch_replace doesn't bother). If the
+            # diff is huge, also truncate it on the way out and stamp
+            # diff_truncated so the WebUI can show the marker. This mirrors
+            # the WriteResult contract so the frontend renderer doesn't
+            # need to special-case patch vs. write_file.
+            if not self.additions and not self.deletions:
+                self.additions, self.deletions = _count_diff_changes(self.diff)
+            truncated_text, was_truncated = _truncate_diff(self.diff)
+            result["diff"] = truncated_text
+            if was_truncated:
+                result["diff_truncated"] = True
+        if self.additions:
+            result["additions"] = self.additions
+        if self.deletions:
+            result["deletions"] = self.deletions
         if self.files_modified:
             result["files_modified"] = self.files_modified
         if self.files_created:
@@ -690,12 +824,22 @@ class ShellFileOperations(FileOperations):
         files. The content never appears in the shell command string —
         only the file path does.
 
+        Captures a unified diff of (prior content) → (new content) when
+        both sides are textual. The diff is intended for UIs that want to
+        render line-by-line +/- output (e.g. WebUI tool cards). The diff
+        is computed AFTER the binary check on each side, so binary writes
+        return an empty diff string rather than garbage. The diff body is
+        truncated at ``_DIFF_MAX_BYTES`` / ``_DIFF_MAX_LINES`` to keep the
+        wire payload bounded — additions/deletions stats always reflect
+        the FULL diff regardless of truncation.
+
         Args:
             path: File path to write
             content: Content to write
 
         Returns:
-            WriteResult with bytes written or error
+            WriteResult with bytes written, dirs_created, and (when
+            applicable) diff/additions/deletions/diff_truncated.
         """
         # Expand ~ and other shell paths
         path = self._expand_path(path)
@@ -704,37 +848,114 @@ class ShellFileOperations(FileOperations):
         if _is_write_denied(path):
             return WriteResult(error=f"Write denied: '{path}' is a protected system/credential file.")
 
+        # Snapshot prior content for diff. Done BEFORE the write so a
+        # concurrent agent's edit between our write and our read can't
+        # produce a diff against someone else's later state. If the file
+        # doesn't exist or is binary, old_content is None and we simply
+        # skip the diff (returns it as empty string).
+        old_content: Optional[str] = None
+        new_is_binary = self._content_looks_binary(content)
+        if not new_is_binary:
+            old_content = self._read_existing_for_diff(path)
+
         # Create parent directories
         parent = os.path.dirname(path)
         dirs_created = False
-        
+
         if parent:
             mkdir_cmd = f"mkdir -p {self._escape_shell_arg(parent)}"
             mkdir_result = self._exec(mkdir_cmd)
             if mkdir_result.exit_code == 0:
                 dirs_created = True
-        
+
         # Write via stdin pipe — content bypasses shell arg parsing entirely,
         # so there's no ARG_MAX limit regardless of file size.
         write_cmd = f"cat > {self._escape_shell_arg(path)}"
         write_result = self._exec(write_cmd, stdin_data=content)
-        
+
         if write_result.exit_code != 0:
             return WriteResult(error=f"Failed to write file: {write_result.stdout}")
-        
+
         # Get bytes written (wc -c is POSIX, works on Linux + macOS)
         stat_cmd = f"wc -c < {self._escape_shell_arg(path)} 2>/dev/null"
         stat_result = self._exec(stat_cmd)
-        
+
         try:
             bytes_written = int(stat_result.stdout.strip())
         except ValueError:
             bytes_written = len(content.encode('utf-8'))
-        
+
+        # Compute diff + stats. Skip silently for any failure path here so
+        # a quirky filesystem condition can never block a successful write.
+        diff_text = ""
+        additions = 0
+        deletions = 0
+        diff_truncated = False
+        if old_content is not None and not new_is_binary:
+            try:
+                full_diff = self._unified_diff(
+                    old_content, content,
+                    filename=os.path.basename(path) or path,
+                )
+                additions, deletions = _count_diff_changes(full_diff)
+                diff_text, diff_truncated = _truncate_diff(full_diff)
+            except Exception:
+                diff_text = ""
+                additions = 0
+                deletions = 0
+                diff_truncated = False
+
         return WriteResult(
             bytes_written=bytes_written,
-            dirs_created=dirs_created
+            dirs_created=dirs_created,
+            diff=diff_text,
+            additions=additions,
+            deletions=deletions,
+            diff_truncated=diff_truncated,
         )
+
+    def _content_looks_binary(self, content: str) -> bool:
+        """Cheap binary check on a string. Null byte is the strongest
+        signal — text files essentially never contain one. Falls back
+        to the same >30% non-printable heuristic used elsewhere.
+        """
+        if not content:
+            return False
+        if "\x00" in content[:8192]:
+            return True
+        sample = content[:1000]
+        non_printable = sum(1 for c in sample if ord(c) < 32 and c not in "\n\r\t")
+        return non_printable / max(len(sample), 1) > 0.30
+
+    def _read_existing_for_diff(self, path: str) -> Optional[str]:
+        """Best-effort read of the prior file content for diff capture.
+
+        Returns:
+          - The file's current content as a string when readable.
+          - "" when the file doesn't exist (creation diff: every line is +).
+          - None when the file exists but is binary, or when the read
+            fails for any other reason — caller should skip the diff.
+        """
+        # File-not-found → treat as creation. We use `wc -c` for the
+        # existence probe because it returns non-zero exit when the file
+        # is missing, and it's already the same probe used by other
+        # methods on this class.
+        stat = self._exec(
+            f"wc -c < {self._escape_shell_arg(path)} 2>/dev/null"
+        )
+        if stat.exit_code != 0:
+            return ""
+        if self._is_image(path):
+            return None
+        sample = self._exec(
+            f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null"
+        )
+        if self._is_likely_binary(path, sample.stdout):
+            return None
+        cat = self._exec(f"cat {self._escape_shell_arg(path)}")
+        if cat.exit_code != 0:
+            return None
+        return cat.stdout
     
     # =========================================================================
     # PATCH Implementation (Replace Mode)

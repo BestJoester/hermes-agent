@@ -42,6 +42,12 @@ if _DEBUG_INTERRUPT:
 # long-running _wait_for_process loops can report liveness to the gateway.
 _activity_callback_local = threading.local()
 
+# Thread-local "live tool output" callback. The agent sets this before a tool
+# call so the drain loop in _wait_for_process can stream stdout chunks back to
+# the UI as the subprocess produces them, instead of users only seeing the
+# final result when the tool finishes.
+_output_callback_local = threading.local()
+
 
 def set_activity_callback(cb: Callable[[str], None] | None) -> None:
     """Register a callback that _wait_for_process fires periodically."""
@@ -50,6 +56,22 @@ def set_activity_callback(cb: Callable[[str], None] | None) -> None:
 
 def _get_activity_callback() -> Callable[[str], None] | None:
     return getattr(_activity_callback_local, "callback", None)
+
+
+def set_tool_output_callback(cb: Callable[[str], None] | None) -> None:
+    """Register a per-thread callback that receives subprocess stdout chunks
+    in real time as the drain loop reads them.
+
+    The agent sets this before each tool execution and clears it afterwards.
+    The callback signature is ``cb(chunk_text)`` — the agent wraps it in a
+    closure that adds the tool name and tool_call_id before forwarding to
+    the gateway / WebUI streaming layer.
+    """
+    _output_callback_local.callback = cb
+
+
+def _get_tool_output_callback() -> Callable[[str], None] | None:
+    return getattr(_output_callback_local, "callback", None)
 
 
 def touch_activity_if_due(
@@ -502,7 +524,19 @@ class BaseEnvironment(ABC):
                             break
                         if not chunk:
                             break  # true EOF — all writers closed
-                        output_chunks.append(decoder.decode(chunk))
+                        text_chunk = decoder.decode(chunk)
+                        output_chunks.append(text_chunk)
+                        # Stream the chunk to the live tool output callback,
+                        # if the agent registered one for this worker thread.
+                        # Errors here MUST NOT break the drain — fall back to
+                        # the buffered-only path silently.
+                        if text_chunk:
+                            try:
+                                _stream_cb = _get_tool_output_callback()
+                                if _stream_cb is not None:
+                                    _stream_cb(text_chunk)
+                            except Exception:
+                                pass
                         idle_after_exit = 0
                     elif proc.poll() is not None:
                         # bash is gone and the pipe was idle for ~100ms.  Give
