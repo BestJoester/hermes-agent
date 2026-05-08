@@ -717,6 +717,8 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        tool_delta_callback=None,
+        tool_output_callback=None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -757,6 +759,8 @@ class APIServerAdapter(BasePlatformAdapter):
             tool_progress_callback=tool_progress_callback,
             tool_start_callback=tool_start_callback,
             tool_complete_callback=tool_complete_callback,
+            tool_delta_callback=tool_delta_callback,
+            tool_output_callback=tool_output_callback,
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
         )
@@ -2533,6 +2537,34 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
+        # Wire tool_delta_callback for streaming tool-call argument deltas.
+        def _tool_delta_cb(name: str, partial_args: str, tool_id: str) -> None:
+            try:
+                loop.call_soon_threadsafe(q.put_nowait, {
+                    event: tool.input.delta,
+                    run_id: run_id,
+                    timestamp: time.time(),
+                    tool: name,
+                    tool_id: tool_id,
+                    args_delta: partial_args,
+                })
+            except Exception:
+                pass
+
+        # Wire tool_output_callback for streaming subprocess stdout.
+        def _tool_output_cb(name: str, tool_id: str, chunk: str) -> None:
+            try:
+                loop.call_soon_threadsafe(q.put_nowait, {
+                    event: tool.output.delta,
+                    run_id: run_id,
+                    timestamp: time.time(),
+                    tool: name,
+                    tool_id: tool_id,
+                    chunk: chunk,
+                })
+            except Exception:
+                pass
+
         self._set_run_status(
             run_id,
             "queued",
@@ -2549,6 +2581,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     session_id=session_id,
                     stream_delta_callback=_text_cb,
                     tool_progress_callback=event_cb,
+                    tool_delta_callback=_tool_delta_cb,
+                    tool_output_callback=_tool_output_cb,
                 )
                 self._active_run_agents[run_id] = agent
                 def _run_sync():
